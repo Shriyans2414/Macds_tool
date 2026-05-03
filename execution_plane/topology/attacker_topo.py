@@ -14,7 +14,9 @@ Switch port mapping (used for sniffing):
     s1-eth4 → h4
 """
 from mininet.topo import Topo
-
+from mininet.net import Mininet
+from mininet.cli import CLI
+from mininet.log import setLogLevel
 
 class AttackTopo(Topo):
     def build(self):
@@ -29,5 +31,19 @@ class AttackTopo(Topo):
         self.addLink(h3, s1)
         self.addLink(h4, s1)
 
-
 topos = {"attacktopo": lambda: AttackTopo()}
+
+if __name__ == '__main__':
+    setLogLevel('info')
+    topo = AttackTopo()
+    net = Mininet(topo=topo)
+    net.start()
+    
+    h1 = net.get('h1')
+    h3 = net.get('h3')
+    
+    h1.cmd("ip -6 addr add 2001:db8::1/64 dev h1-eth0")
+    h3.cmd("ip -6 addr add 2001:db8::3/64 dev h3-eth0")
+    
+    CLI(net)
+    net.stop()

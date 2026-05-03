@@ -1,30 +1,55 @@
-import boto3
-# FIX: removed unused import json
+import os
+import requests
+import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-dynamodb = boto3.resource("dynamodb", region_name="ap-south-1")
-table = dynamodb.Table("macds-attack-history")
+CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://localhost:8000")
+MACDS_API_KEY = os.environ.get("MACDS_API_KEY", "changeme-set-in-env")
+
+_cached_verdicts = []
+_last_fetch = 0.0
+
+def fetch_verdicts(limit=200):
+    global _cached_verdicts, _last_fetch
+    now = time.time()
+    if now - _last_fetch < 5.0:
+        return _cached_verdicts
+        
+    try:
+        resp = requests.get(
+            f"{CONTROL_PLANE_URL}/api/verdicts",
+            headers={"X-MACDS-Key": MACDS_API_KEY},
+            params={"limit": limit},
+            timeout=5
+        )
+        if resp.status_code == 200:
+            _cached_verdicts = resp.json().get("verdicts", [])
+            _last_fetch = now
+    except Exception as e:
+        print(f"[Dashboard ERROR] {e}")
+        
+    return _cached_verdicts
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
     def do_GET(self):
-        items = table.scan().get("Items", [])
+        items = fetch_verdicts()
         counts = {}
         actions = {"block_ip": 0, "raise_alert": 0, "do_nothing": 0}
         for item in items:
             at = item.get("attack_type", "unknown")
             counts[at] = counts.get(at, 0) + 1
-            ad = item.get("action_decided", "do_nothing")
+            ad = item.get("action", "do_nothing")
             if ad in actions:
                 actions[ad] += 1
 
         rows = "".join(f'''<tr>
 <td>{i.get("attack_type","")}</td>
 <td>{i.get("source_ip","")}</td>
-<td style="color:{"#f85149" if i.get("action_decided")=="block_ip" else "#d29922" if i.get("action_decided")=="raise_alert" else "#8b949e"}">{i.get("action_decided","")}</td>
+<td style="color:{"#f85149" if i.get("action")=="block_ip" else "#d29922" if i.get("action")=="raise_alert" else "#8b949e"}">{i.get("action","")}</td>
 <td>{i.get("packet_rate","")} pps</td>
-</tr>''' for i in sorted(items, key=lambda x: x.get("timestamp",""), reverse=True))
+</tr>''' for i in items)
 
         breakdown = "".join(f'<tr><td>{k}</td><td>{v}</td></tr>' for k,v in counts.items())
 
@@ -51,16 +76,16 @@ td{{padding:12px 16px;border-bottom:1px solid #21262d;font-size:13px}}
 </head>
 <body>
 <h1>MACDS Attack Monitor</h1>
-<p class="sub">Live dashboard — auto-refreshes every 5 seconds</p>
+<p class="sub">Live dashboard — auto-refreshes every 5 seconds (API backend)</p>
 <div class="cards">
-  <div class="card"><h2 class="total">{len(items)}</h2><p>Total Attacks</p></div>
+  <div class="card"><h2 class="total">{len(items)}</h2><p>Recent Attacks (200)</p></div>
   <div class="card"><h2 class="blocked">{actions["block_ip"]}</h2><p>IPs Blocked</p></div>
   <div class="card"><h2 class="alerted">{actions["raise_alert"]}</h2><p>Alerts Raised</p></div>
   <div class="card"><h2 style="color:#3fb950">{len(counts)}</h2><p>Attack Types Seen</p></div>
 </div>
 <h3>Attack Type Breakdown</h3>
 <table><tr><th>Attack Type</th><th>Count</th></tr>{breakdown}</table>
-<h3>Full Attack History</h3>
+<h3>Recent Attack History</h3>
 <table>
 <tr><th>Attack Type</th><th>Source IP</th><th>Action Taken</th><th>Packet Rate</th></tr>
 {rows}

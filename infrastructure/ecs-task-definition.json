@@ -1,0 +1,49 @@
+{
+  "family": "macds-control-plane-task",
+  "networkMode": "awsvpc",
+  "executionRoleArn": "arn:aws:iam::904690835691:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::904690835691:role/macds-ecs-task-role",
+  "cpu": "1024",
+  "memory": "2048",
+  "requiresCompatibilities": ["FARGATE"],
+  "containerDefinitions": [
+    {
+      "name": "macds-control-plane",
+      "image": "904690835691.dkr.ecr.ap-south-1.amazonaws.com/macds-control-plane:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8000,
+          "hostPort": 8000,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        { "name": "REDIS_URL", "value": "redis://redis.macds.internal:6379/0" },
+        { "name": "AWS_DEFAULT_REGION", "value": "ap-south-1" },
+        { "name": "QTABLE_DIR", "value": "/app/qtables" }
+      ],
+      "secrets": [
+        {
+          "name": "MACDS_API_KEY",
+          "valueFrom": "arn:aws:secretsmanager:ap-south-1:904690835691:secret:macds/api-key"
+        }
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/macds",
+          "awslogs-region": "ap-south-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
+    }
+  ]
+}

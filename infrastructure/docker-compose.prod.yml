@@ -1,0 +1,57 @@
+version: "3.8"
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    networks:
+      - macds_net
+
+  macds_control_plane:
+    build: 
+      context: ../control_plane
+      dockerfile: Dockerfile
+    image: macds-control-plane:latest
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - MACDS_API_KEY=${MACDS_API_KEY:-changeme-set-in-env}
+      - REDIS_URL=redis://redis:6379/0
+      - QTABLE_DIR=/app/qtables
+      - AWS_DEFAULT_REGION=ap-south-1
+    depends_on:
+      - redis
+    volumes:
+      - ../control_plane/qtables:/app/qtables
+      - ~/.aws:/root/.aws:ro
+    networks:
+      - macds_net
+
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      - macds_net
+
+  grafana:
+    image: grafana/grafana:latest
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    networks:
+      - macds_net
+
+networks:
+  macds_net:
+    driver: bridge
