@@ -1,8 +1,10 @@
 import requests
 import json
 
-RYU_REST_URL = "http://127.0.0.1:8080/stats/flowentry/add"
-RYU_DELETE_URL = "http://127.0.0.1:8080/stats/flowentry/delete"
+import os
+_RYU_BASE    = os.environ.get("RYU_REST_URL", "http://127.0.0.1:8080")
+RYU_REST_URL   = f"{_RYU_BASE}/stats/flowentry/add"
+RYU_DELETE_URL = f"{_RYU_BASE}/stats/flowentry/delete"
 
 def push_block_flow(ip: str, dpid: int = 1):
     payload = {

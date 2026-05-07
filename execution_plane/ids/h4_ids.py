@@ -59,7 +59,7 @@ packet_buffer: deque = deque()
 buffer_lock = threading.Lock()
 
 attack_state = {
-    "ddos":        False,
+    "icmp_flood":  False,
     "syn_flood":   False,
     "udp_flood":   False,
     "port_scan":   False,
@@ -71,7 +71,7 @@ attack_state = {
 # source IP in the ATTACK_END alert. Without this, when traffic drops to
 # zero, syn_counts is empty and we have no IP to reference.
 _last_attacker: dict = {
-    "ddos":        None,
+    "icmp_flood":  None,
     "syn_flood":   None,
     "udp_flood":   None,
     "port_scan":   None,
@@ -97,10 +97,24 @@ def log_event(event: str, attack: str, src: str):
 
 # ── Control plane notification ─────────────────────────────────────────────────
 
-def send_alert(attack_type: str, src_ip: str, packet_rate: float = 0.0):
+def send_alert(attack_type: str, src_ip: str, packet_rate: float = 0.0,
+               connection_count: float = 0.0,
+               flow_duration: float = 0.3,
+               unique_ports: float = 1.0,
+               syn_ack_ratio: float = 0.05,
+               payload_entropy: float = 1.0):
+    """
+    Send alert to control plane.
+    Note: flow_duration, unique_ports, syn_ack_ratio, payload_entropy
+    are calibrated approximations for rate-based detections.
+    h4_ids operates at packet-count level and cannot measure
+    per-packet flow features — the DPI sends real measured values.
+    Approximations: floods have short flows (0.3s), low ACK ratio
+    (0.05), single target port (1), low payload entropy (1.0).
+    """
     if OFFLINE_MODE:
         return
-    send_log(attack_type, src_ip, packet_rate=packet_rate)
+    send_log(attack_type, src_ip, packet_rate=packet_rate, connection_count=connection_count, flow_duration=flow_duration, unique_ports=unique_ports, syn_ack_ratio=syn_ack_ratio, payload_entropy=payload_entropy)
 
 
 # ── Packet capture ─────────────────────────────────────────────────────────────
@@ -139,7 +153,7 @@ def detect_syn_flood(packets: list):
                 _last_attacker["syn_flood"] = src_ip
                 print(f"[ATTACK START] SYN FLOOD from {src_ip} ({count} pps)")
                 log_event("ATTACK_START", "SYN_FLOOD", src_ip)
-                send_alert("SYN_FLOOD", src_ip, packet_rate=float(count))
+                send_alert("SYN_FLOOD", src_ip, packet_rate=float(count), connection_count=float(count), flow_duration=0.3, unique_ports=1, syn_ack_ratio=0.05, payload_entropy=1.0)
                 break
     else:
         # Currently under attack — check if it ended
@@ -164,22 +178,25 @@ def detect_ddos(packets: list):
         if ICMP in pkt and now - ts <= SHORT_WINDOW:
             icmp_counts[pkt[IP].src] += 1
 
-    if not attack_state["ddos"]:
+    if not attack_state["icmp_flood"]:
         for src_ip, count in icmp_counts.items():
             if count >= ICMP_PPS_THRESHOLD:
-                attack_state["ddos"] = True
-                _last_attacker["ddos"] = src_ip
-                print(f"[ATTACK START] DDOS from {src_ip} ({count} pps)")
-                log_event("ATTACK_START", "DDOS", src_ip)
-                send_alert("DDOS", src_ip, packet_rate=float(count))
+                attack_state["icmp_flood"] = True
+                _last_attacker["icmp_flood"] = src_ip
+                print(f"[ATTACK START] ICMP_FLOOD from {src_ip} ({count} pps)")
+                log_event("ATTACK_START", "ICMP_FLOOD", src_ip)
+                send_alert("ICMP_FLOOD", src_ip, packet_rate=float(count),
+                           connection_count=float(count),
+                           flow_duration=0.3, unique_ports=1,
+                           syn_ack_ratio=0.05, payload_entropy=1.0)
                 break
     else:
-        src_ip = _last_attacker["ddos"]
+        src_ip = _last_attacker["icmp_flood"]
         current_count = icmp_counts.get(src_ip, 0)
         if current_count < ICMP_PPS_THRESHOLD:
-            attack_state["ddos"] = False
-            print(f"[ATTACK END] DDOS ended from {src_ip}")
-            log_event("ATTACK_END", "DDOS", src_ip)
+            attack_state["icmp_flood"] = False
+            print(f"[ATTACK END] ICMP_FLOOD ended from {src_ip}")
+            log_event("ATTACK_END", "ICMP_FLOOD", src_ip)
             send_alert("none", src_ip)
 
 
@@ -202,7 +219,7 @@ def detect_udp_flood(packets: list):
                 _last_attacker["udp_flood"] = src_ip
                 print(f"[ATTACK START] UDP FLOOD from {src_ip} ({count} pps)")
                 log_event("ATTACK_START", "UDP_FLOOD", src_ip)
-                send_alert("UDP_FLOOD", src_ip, packet_rate=float(count))
+                send_alert("UDP_FLOOD", src_ip, packet_rate=float(count), connection_count=float(count), flow_duration=0.3, unique_ports=1, syn_ack_ratio=0.05, payload_entropy=1.0)
                 break
     else:
         src_ip = _last_attacker["udp_flood"]
@@ -238,7 +255,12 @@ def detect_port_scan(packets: list):
                 _last_attacker["port_scan"] = src_ip
                 print(f"[ATTACK START] PORT SCAN from {src_ip} ({len(ports)} ports in {SHORT_WINDOW}s)")
                 log_event("ATTACK_START", "PORT_SCAN", src_ip)
-                send_alert("PORT_SCAN", src_ip, packet_rate=float(len(ports)))
+                send_alert("PORT_SCAN", src_ip, packet_rate=float(len(ports)),
+                           connection_count=float(len(ports)),
+                           flow_duration=0.5,
+                           unique_ports=float(len(ports)),
+                           syn_ack_ratio=0.1,
+                           payload_entropy=0.0)
                 break
     else:
         src_ip = _last_attacker["port_scan"]
@@ -276,7 +298,7 @@ def detect_http_flood(packets: list):
                 _last_attacker["http_flood"] = src_ip
                 print(f"[ATTACK START] HTTP FLOOD from {src_ip} ({count} pps to port 80)")
                 log_event("ATTACK_START", "HTTP_FLOOD", src_ip)
-                send_alert("HTTP_FLOOD", src_ip, packet_rate=float(count))
+                send_alert("HTTP_FLOOD", src_ip, packet_rate=float(count), connection_count=float(count), flow_duration=0.3, unique_ports=1, syn_ack_ratio=0.05, payload_entropy=1.0)
                 break
     else:
         src_ip = _last_attacker["http_flood"]
@@ -308,7 +330,7 @@ def detect_land_attack(packets: list):
                     _last_attacker["land_attack"] = src_ip
                     print(f"[ATTACK START] LAND ATTACK detected (src==dst={src_ip})")
                     log_event("ATTACK_START", "LAND_ATTACK", src_ip)
-                    send_alert("LAND_ATTACK", src_ip, packet_rate=1.0)
+                    send_alert("LAND_ATTACK", src_ip, packet_rate=1.0, connection_count=1.0, flow_duration=0.3, unique_ports=1, syn_ack_ratio=0.05, payload_entropy=1.0)
                 return  # One match is enough — no need to keep scanning
 
     # No land packets seen in this window — clear the state

@@ -644,6 +644,39 @@ def cleanup_loop():
                 for ip in stale: del _flows[ip]
         except Exception:
             pass
+
+        try:
+            now = time.time()
+            with _suspicion_lock:
+                stale = [ip for ip, e in _suspicion_scores.items()
+                         if now - e["last_update"] > 300]
+                for ip in stale:
+                    del _suspicion_scores[ip]
+
+            with _exfil_lock:
+                stale = [ip for ip, e in _exfil.items()
+                         if e["start"] > 0 and now - e["start"] > EXFIL_WINDOW_SECONDS * 3]
+                for ip in stale:
+                    del _exfil[ip]
+
+            with _brute_lock:
+                stale = [ip for ip in _brute
+                         if all(
+                             len(q) == 0 or now - max(q) > 30
+                             for q in _brute[ip].values()
+                         )]
+                for ip in stale:
+                    del _brute[ip]
+
+            with state_lock:
+                stale = [ip for ip, s in attack_state.items()
+                         if not s["active"]]
+                for ip in stale:
+                    del attack_state[ip]
+
+        except Exception:
+            pass
+
         time.sleep(30)
 
 

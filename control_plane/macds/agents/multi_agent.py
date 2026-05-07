@@ -11,7 +11,7 @@ Upgrades vs previous version:
      Rare attacks (log4shell, shellshock, brute force) are replayed
      proportionally instead of being drowned by benign traffic.
   4. Gradient clipping: prevents exploding gradients on large rewards.
-  5. State dim 30 = 8 continuous + 22-type one-hot (was 21 = 3 + 18).
+  5. State dim 35 = 8 continuous + 27-type one-hot (was 21 = 3 + 18).
      New continuous features: connection_count, flow_duration,
      unique_ports, syn_ack_ratio, payload_entropy.
      New attack types: ssh_brute_force, rdp_brute_force,
@@ -38,15 +38,16 @@ ATTACK_TYPES = [
     "port_scan", "land_attack",
     "sql_injection", "xss", "path_traversal",
     "log4shell", "shellshock", "cmd_injection", "ssrf",
+    "spring4shell", "struts_rce", "php_injection", "xxe", "ssti",
     "dns_amplification", "dns_dga",
     "ssh_brute_force", "rdp_brute_force", "ftp_brute_force",
     "craft_attack", "anomaly", "data_exfiltration",
 ]
 
 ATTACK_INDEX   = {a: i for i, a in enumerate(ATTACK_TYPES)}
-N_ATTACK_TYPES = len(ATTACK_TYPES)   # 22
+N_ATTACK_TYPES = len(ATTACK_TYPES)   # 27
 CONTINUOUS_DIM = 8
-STATE_DIM      = CONTINUOUS_DIM + N_ATTACK_TYPES  # 30
+STATE_DIM      = CONTINUOUS_DIM + N_ATTACK_TYPES  # 35
 
 ACTIONS   = ["do_nothing", "raise_alert", "block_ip", "unblock_ip"]
 N_ACTIONS = len(ACTIONS)
@@ -336,6 +337,7 @@ class MultiAgentSystem:
         is_app = attack_type.lower() in (
             "sql_injection", "xss", "log4shell", "shellshock",
             "cmd_injection", "ssrf", "path_traversal", "data_exfiltration",
+            "spring4shell", "struts_rce", "php_injection", "xxe", "ssti",
         )
         is_brute = attack_type.lower() in (
             "ssh_brute_force", "rdp_brute_force", "ftp_brute_force"

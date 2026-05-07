@@ -4,8 +4,6 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    ports:
-      - "6379:6379"
     networks:
       - macds_net
 
@@ -16,9 +14,9 @@ services:
     image: macds-control-plane:latest
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
-      - MACDS_API_KEY=${MACDS_API_KEY:-changeme-set-in-env}
+      - MACDS_API_KEY=${MACDS_API_KEY:?MACDS_API_KEY must be set in production}
       - REDIS_URL=redis://redis:6379/0
       - QTABLE_DIR=/app/qtables
       - AWS_DEFAULT_REGION=ap-south-1
@@ -48,7 +46,7 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD must be set}
     networks:
       - macds_net
 

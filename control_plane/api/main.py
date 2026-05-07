@@ -60,6 +60,7 @@ _lock = threading.Lock()
 pending_actions = {}
 _last_attack_state: dict[str, dict] = {}
 _block_timestamps: dict[str, float] = {}
+_agents_lock = threading.RLock()
 
 def push_action(ip: str, action: str):
     if REDIS_OK:
@@ -68,13 +69,28 @@ def push_action(ip: str, action: str):
         with _lock:
             pending_actions[ip] = action
 
+_POP_ACTION_LUA = """
+local key = KEYS[1]
+local items = redis.call('HGETALL', key)
+if #items == 0 then return nil end
+local ip = items[1]
+local action = items[2]
+redis.call('HDEL', key, ip)
+return {ip, action}
+"""
+_pop_action_script = None
+
 def pop_action():
+    global _pop_action_script
     if REDIS_OK:
-        items = _redis.hgetall("macds:pending")
-        if items:
-            ip, action = next(iter(items.items()))
-            _redis.hdel("macds:pending", ip)
-            return ip, action
+        try:
+            if _pop_action_script is None:
+                _pop_action_script = _redis.register_script(_POP_ACTION_LUA)
+            result = _pop_action_script(keys=["macds:pending"])
+            if result:
+                return result[0], result[1]
+        except Exception:
+            pass
         return None, None
     else:
         with _lock:
@@ -101,17 +117,170 @@ def log_event(event: str, attack: str, src: str, detail: str = "", confidence: s
         pass
 
 def _log_writer():
-    handler = RotatingFileHandler(LOG_FILE, maxBytes=10*1024*1024, backupCount=5)
+    import csv as _csv
+    import io as _io
+
+    handler = RotatingFileHandler(
+        LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5
+    )
+    handler.setLevel(logging.DEBUG)
+
+    # Write CSV header if file is new or empty
+    if not os.path.exists(LOG_FILE) or os.path.getsize(LOG_FILE) == 0:
+        buf = _io.StringIO()
+        _csv.writer(buf).writerow([
+            "timestamp", "event", "attack_type",
+            "source_ip", "confidence", "detail"
+        ])
+        record = logging.makeLogRecord({"msg": buf.getvalue().rstrip("\r\n")})
+        handler.emit(record)
+
     while True:
         try:
             entry = _log_queue.get(timeout=1.0)
-            row = f"{entry['timestamp']},{entry['event']},{entry['attack']},{entry['src']},{entry['confidence']},{entry['detail'][:200]}\n"
-            handler.stream.write(row)
-            handler.stream.flush()
+            buf = _io.StringIO()
+            _csv.writer(buf).writerow([
+                entry["timestamp"],
+                entry["event"],
+                entry["attack"],
+                entry["src"],
+                entry["confidence"],
+                entry["detail"][:200],
+            ])
+            record = logging.makeLogRecord({
+                "msg": buf.getvalue().rstrip("\r\n")
+            })
+            handler.emit(record)
         except queue.Empty:
             pass
         except Exception as e:
             print(f"[LOG WRITER ERROR] {e}")
+
+_TRAINING_STABLE_STATE = {
+    "packet_rate":50,"cpu_usage":20,"bandwidth_usage":20,
+    "attack_type":"none","connection_count":5,"flow_duration":2.0,
+    "unique_ports":3,"syn_ack_ratio":0.95,"payload_entropy":3.5,
+}
+
+_S = {"connection_count":5,"flow_duration":2.0,
+      "unique_ports":3,"syn_ack_ratio":0.95,"payload_entropy":3.5}
+
+_TRAINING_SCENARIOS = [
+    ({**_S,"packet_rate":3000,"cpu_usage":95,"bandwidth_usage":99,
+      "attack_type":"syn_flood","connection_count":5000,
+      "flow_duration":0.1,"unique_ports":1,"syn_ack_ratio":0.02,
+      "payload_entropy":1.0}, "block_ip", 2.0),
+    ({**_S,"packet_rate":2500,"cpu_usage":85,"bandwidth_usage":95,
+      "attack_type":"udp_flood","connection_count":3000,
+      "flow_duration":0.05,"unique_ports":1,"syn_ack_ratio":1.0,
+      "payload_entropy":7.5}, "block_ip", 2.0),
+    ({**_S,"packet_rate":2000,"cpu_usage":80,"bandwidth_usage":90,
+      "attack_type":"icmp_flood","connection_count":2000,
+      "flow_duration":0.01,"unique_ports":1,"syn_ack_ratio":1.0,
+      "payload_entropy":0.5}, "block_ip", 2.0),
+    ({**_S,"packet_rate":1500,"cpu_usage":75,"bandwidth_usage":85,
+      "attack_type":"http_flood","connection_count":1500,
+      "flow_duration":0.3,"unique_ports":1,"syn_ack_ratio":0.5,
+      "payload_entropy":4.5}, "block_ip", 2.0),
+    ({**_S,"packet_rate":200,"cpu_usage":30,"bandwidth_usage":20,
+      "attack_type":"port_scan","connection_count":200,
+      "flow_duration":0.1,"unique_ports":500,"syn_ack_ratio":0.1,
+      "payload_entropy":0.0}, "raise_alert", 1.0),
+    ({**_S,"packet_rate":50,"cpu_usage":20,"bandwidth_usage":10,
+      "attack_type":"sql_injection","connection_count":3,
+      "flow_duration":1.5,"unique_ports":1,"syn_ack_ratio":0.99,
+      "payload_entropy":4.2}, "block_ip", 2.0),
+    ({**_S,"packet_rate":50,"cpu_usage":20,"bandwidth_usage":10,
+      "attack_type":"xss","connection_count":3,"flow_duration":1.0,
+      "unique_ports":1,"syn_ack_ratio":0.99,
+      "payload_entropy":4.0}, "block_ip", 2.0),
+    ({**_S,"packet_rate":50,"cpu_usage":20,"bandwidth_usage":10,
+      "attack_type":"path_traversal","connection_count":2,
+      "flow_duration":0.8,"unique_ports":1,"syn_ack_ratio":0.99,
+      "payload_entropy":3.8}, "block_ip", 2.0),
+    ({**_S,"packet_rate":20,"cpu_usage":15,"bandwidth_usage":5,
+      "attack_type":"log4shell","connection_count":1,
+      "flow_duration":0.5,"unique_ports":1,"syn_ack_ratio":0.99,
+      "payload_entropy":5.5}, "block_ip", 2.0),
+    ({**_S,"packet_rate":20,"cpu_usage":15,"bandwidth_usage":5,
+      "attack_type":"shellshock","connection_count":1,
+      "flow_duration":0.3,"unique_ports":1,"syn_ack_ratio":0.99,
+      "payload_entropy":4.8}, "block_ip", 2.0),
+    ({**_S,"packet_rate":20,"cpu_usage":15,"bandwidth_usage":5,
+      "attack_type":"cmd_injection","connection_count":1,
+      "flow_duration":0.4,"unique_ports":1,"syn_ack_ratio":0.99,
+      "payload_entropy":4.5}, "block_ip", 2.0),
+    ({**_S,"packet_rate":30,"cpu_usage":20,"bandwidth_usage":10,
+      "attack_type":"ssrf","connection_count":2,"flow_duration":1.0,
+      "unique_ports":1,"syn_ack_ratio":0.99,
+      "payload_entropy":4.3}, "block_ip", 2.0),
+    ({**_S,"packet_rate":500,"cpu_usage":50,"bandwidth_usage":60,
+      "attack_type":"dns_amplification","connection_count":100,
+      "flow_duration":0.05,"unique_ports":1,"syn_ack_ratio":1.0,
+      "payload_entropy":6.0}, "block_ip", 2.0),
+    ({**_S,"packet_rate":100,"cpu_usage":20,"bandwidth_usage":15,
+      "attack_type":"dns_dga","connection_count":20,
+      "flow_duration":0.5,"unique_ports":1,"syn_ack_ratio":1.0,
+      "payload_entropy":5.8}, "block_ip", 2.0),
+    ({**_S,"packet_rate":50,"cpu_usage":10,"bandwidth_usage":5,
+      "attack_type":"ssh_brute_force","connection_count":30,
+      "flow_duration":0.3,"unique_ports":1,"syn_ack_ratio":0.9,
+      "payload_entropy":3.0}, "block_ip", 2.0),
+    ({**_S,"packet_rate":40,"cpu_usage":10,"bandwidth_usage":5,
+      "attack_type":"rdp_brute_force","connection_count":25,
+      "flow_duration":0.4,"unique_ports":1,"syn_ack_ratio":0.9,
+      "payload_entropy":3.2}, "block_ip", 2.0),
+    ({**_S,"packet_rate":30,"cpu_usage":10,"bandwidth_usage":5,
+      "attack_type":"ftp_brute_force","connection_count":20,
+      "flow_duration":0.5,"unique_ports":1,"syn_ack_ratio":0.9,
+      "payload_entropy":2.8}, "block_ip", 2.0),
+    ({**_S,"packet_rate":200,"cpu_usage":30,"bandwidth_usage":80,
+      "attack_type":"data_exfiltration","connection_count":5,
+      "flow_duration":120.0,"unique_ports":3,"syn_ack_ratio":0.99,
+      "payload_entropy":7.8}, "block_ip", 2.0),
+    ({**_S,"packet_rate":100,"cpu_usage":25,"bandwidth_usage":30,
+      "attack_type":"craft_attack","connection_count":50,
+      "flow_duration":0.1,"unique_ports":50,"syn_ack_ratio":0.05,
+      "payload_entropy":0.5}, "block_ip", 2.0),
+    ({**_S,"packet_rate":50,"cpu_usage":20,"bandwidth_usage":10,
+      "attack_type":"land_attack","connection_count":1,
+      "flow_duration":0.0,"unique_ports":1,"syn_ack_ratio":0.0,
+      "payload_entropy":0.0}, "block_ip", 2.0),
+    ({**_S,"packet_rate":20,"cpu_usage":15,"bandwidth_usage":5,
+      "attack_type":"spring4shell","connection_count":1,
+      "flow_duration":0.5,"unique_ports":1,"syn_ack_ratio":0.99,
+      "payload_entropy":4.8}, "block_ip", 2.0),
+    ({**_S,"packet_rate":20,"cpu_usage":15,"bandwidth_usage":5,
+      "attack_type":"struts_rce","connection_count":1,
+      "flow_duration":0.4,"unique_ports":1,"syn_ack_ratio":0.99,
+      "payload_entropy":4.6}, "block_ip", 2.0),
+    ({**_S,"packet_rate":30,"cpu_usage":20,"bandwidth_usage":10,
+      "attack_type":"php_injection","connection_count":2,
+      "flow_duration":0.6,"unique_ports":1,"syn_ack_ratio":0.99,
+      "payload_entropy":4.3}, "block_ip", 2.0),
+    ({**_S,"packet_rate":20,"cpu_usage":15,"bandwidth_usage":5,
+      "attack_type":"xxe","connection_count":1,
+      "flow_duration":0.5,"unique_ports":1,"syn_ack_ratio":0.99,
+      "payload_entropy":4.1}, "block_ip", 2.0),
+    ({**_S,"packet_rate":20,"cpu_usage":15,"bandwidth_usage":5,
+      "attack_type":"ssti","connection_count":1,
+      "flow_duration":0.4,"unique_ports":1,"syn_ack_ratio":0.99,
+      "payload_entropy":4.4}, "block_ip", 2.0),
+    ({**_S,"packet_rate":300,"cpu_usage":40,"bandwidth_usage":50,
+      "attack_type":"anomaly","connection_count":50,
+      "flow_duration":5.0,"unique_ports":20,"syn_ack_ratio":0.5,
+      "payload_entropy":5.0}, "raise_alert", 1.0),
+    ({**_S,"packet_rate":50,"cpu_usage":20,"bandwidth_usage":20,
+      "attack_type":"none"}, "do_nothing", 0.5),
+    ({**_S,"packet_rate":80,"cpu_usage":25,"bandwidth_usage":30,
+      "attack_type":"none","connection_count":8,"flow_duration":5.0,
+      "unique_ports":5,"syn_ack_ratio":0.92,
+      "payload_entropy":4.0}, "do_nothing", 0.5),
+    ({**_S,"packet_rate":120,"cpu_usage":35,"bandwidth_usage":40,
+      "attack_type":"none","connection_count":15,"flow_duration":8.0,
+      "unique_ports":8,"syn_ack_ratio":0.90,
+      "payload_entropy":4.2}, "do_nothing", 0.5),
+]
 
 _dedup_cache: dict = {}
 DEDUP_TTL = 10.0
@@ -124,6 +293,12 @@ def _cleanup_block_timestamps():
             stale = [ip for ip, ts in _block_timestamps.items() if ts < cutoff]
             for ip in stale:
                 del _block_timestamps[ip]
+            if len(_block_timestamps) > 10_000:
+                oldest = sorted(
+                    _block_timestamps.items(), key=lambda x: x[1]
+                )[:len(_block_timestamps) - 10_000]
+                for ip, _ in oldest:
+                    del _block_timestamps[ip]
         stale_dedup = [k for k, (ts, _) in list(_dedup_cache.items()) if time.time() - ts > DEDUP_TTL]
         for k in stale_dedup:
             _dedup_cache.pop(k, None)
@@ -139,109 +314,8 @@ agent_epsilon = Gauge("macds_agent_epsilon", "Agent epsilon value", ["agent"])
 agents = MultiAgentSystem()
 
 def _silent_pretrain(agents_, rounds=1000):
-    S = {"connection_count":5,"flow_duration":2.0,
-         "unique_ports":3,"syn_ack_ratio":0.95,"payload_entropy":3.5}
-    scenarios = [
-        ({**S,"packet_rate":3000,"cpu_usage":95,"bandwidth_usage":99,
-          "attack_type":"syn_flood","connection_count":5000,
-          "flow_duration":0.1,"unique_ports":1,"syn_ack_ratio":0.02,
-          "payload_entropy":1.0}, "block_ip", 2.0),
-        ({**S,"packet_rate":2500,"cpu_usage":85,"bandwidth_usage":95,
-          "attack_type":"udp_flood","connection_count":3000,
-          "flow_duration":0.05,"unique_ports":1,"syn_ack_ratio":1.0,
-          "payload_entropy":7.5}, "block_ip", 2.0),
-        ({**S,"packet_rate":2000,"cpu_usage":80,"bandwidth_usage":90,
-          "attack_type":"icmp_flood","connection_count":2000,
-          "flow_duration":0.01,"unique_ports":1,"syn_ack_ratio":1.0,
-          "payload_entropy":0.5}, "block_ip", 2.0),
-        ({**S,"packet_rate":1500,"cpu_usage":75,"bandwidth_usage":85,
-          "attack_type":"http_flood","connection_count":1500,
-          "flow_duration":0.3,"unique_ports":1,"syn_ack_ratio":0.5,
-          "payload_entropy":4.5}, "block_ip", 2.0),
-        ({**S,"packet_rate":200,"cpu_usage":30,"bandwidth_usage":20,
-          "attack_type":"port_scan","connection_count":200,
-          "flow_duration":0.1,"unique_ports":500,"syn_ack_ratio":0.1,
-          "payload_entropy":0.0}, "raise_alert", 1.0),
-        ({**S,"packet_rate":50,"cpu_usage":20,"bandwidth_usage":10,
-          "attack_type":"sql_injection","connection_count":3,
-          "flow_duration":1.5,"unique_ports":1,"syn_ack_ratio":0.99,
-          "payload_entropy":4.2}, "block_ip", 2.0),
-        ({**S,"packet_rate":50,"cpu_usage":20,"bandwidth_usage":10,
-          "attack_type":"xss","connection_count":3,"flow_duration":1.0,
-          "unique_ports":1,"syn_ack_ratio":0.99,
-          "payload_entropy":4.0}, "block_ip", 2.0),
-        ({**S,"packet_rate":50,"cpu_usage":20,"bandwidth_usage":10,
-          "attack_type":"path_traversal","connection_count":2,
-          "flow_duration":0.8,"unique_ports":1,"syn_ack_ratio":0.99,
-          "payload_entropy":3.8}, "block_ip", 2.0),
-        ({**S,"packet_rate":20,"cpu_usage":15,"bandwidth_usage":5,
-          "attack_type":"log4shell","connection_count":1,
-          "flow_duration":0.5,"unique_ports":1,"syn_ack_ratio":0.99,
-          "payload_entropy":5.5}, "block_ip", 2.0),
-        ({**S,"packet_rate":20,"cpu_usage":15,"bandwidth_usage":5,
-          "attack_type":"shellshock","connection_count":1,
-          "flow_duration":0.3,"unique_ports":1,"syn_ack_ratio":0.99,
-          "payload_entropy":4.8}, "block_ip", 2.0),
-        ({**S,"packet_rate":20,"cpu_usage":15,"bandwidth_usage":5,
-          "attack_type":"cmd_injection","connection_count":1,
-          "flow_duration":0.4,"unique_ports":1,"syn_ack_ratio":0.99,
-          "payload_entropy":4.5}, "block_ip", 2.0),
-        ({**S,"packet_rate":30,"cpu_usage":20,"bandwidth_usage":10,
-          "attack_type":"ssrf","connection_count":2,"flow_duration":1.0,
-          "unique_ports":1,"syn_ack_ratio":0.99,
-          "payload_entropy":4.3}, "block_ip", 2.0),
-        ({**S,"packet_rate":500,"cpu_usage":50,"bandwidth_usage":60,
-          "attack_type":"dns_amplification","connection_count":100,
-          "flow_duration":0.05,"unique_ports":1,"syn_ack_ratio":1.0,
-          "payload_entropy":6.0}, "block_ip", 2.0),
-        ({**S,"packet_rate":100,"cpu_usage":20,"bandwidth_usage":15,
-          "attack_type":"dns_dga","connection_count":20,
-          "flow_duration":0.5,"unique_ports":1,"syn_ack_ratio":1.0,
-          "payload_entropy":5.8}, "block_ip", 2.0),
-        ({**S,"packet_rate":50,"cpu_usage":10,"bandwidth_usage":5,
-          "attack_type":"ssh_brute_force","connection_count":30,
-          "flow_duration":0.3,"unique_ports":1,"syn_ack_ratio":0.9,
-          "payload_entropy":3.0}, "block_ip", 2.0),
-        ({**S,"packet_rate":40,"cpu_usage":10,"bandwidth_usage":5,
-          "attack_type":"rdp_brute_force","connection_count":25,
-          "flow_duration":0.4,"unique_ports":1,"syn_ack_ratio":0.9,
-          "payload_entropy":3.2}, "block_ip", 2.0),
-        ({**S,"packet_rate":30,"cpu_usage":10,"bandwidth_usage":5,
-          "attack_type":"ftp_brute_force","connection_count":20,
-          "flow_duration":0.5,"unique_ports":1,"syn_ack_ratio":0.9,
-          "payload_entropy":2.8}, "block_ip", 2.0),
-        ({**S,"packet_rate":200,"cpu_usage":30,"bandwidth_usage":80,
-          "attack_type":"data_exfiltration","connection_count":5,
-          "flow_duration":120.0,"unique_ports":3,"syn_ack_ratio":0.99,
-          "payload_entropy":7.8}, "block_ip", 2.0),
-        ({**S,"packet_rate":100,"cpu_usage":25,"bandwidth_usage":30,
-          "attack_type":"craft_attack","connection_count":50,
-          "flow_duration":0.1,"unique_ports":50,"syn_ack_ratio":0.05,
-          "payload_entropy":0.5}, "block_ip", 2.0),
-        ({**S,"packet_rate":50,"cpu_usage":20,"bandwidth_usage":10,
-          "attack_type":"land_attack","connection_count":1,
-          "flow_duration":0.0,"unique_ports":1,"syn_ack_ratio":0.0,
-          "payload_entropy":0.0}, "block_ip", 2.0),
-        ({**S,"packet_rate":300,"cpu_usage":40,"bandwidth_usage":50,
-          "attack_type":"anomaly","connection_count":50,
-          "flow_duration":5.0,"unique_ports":20,"syn_ack_ratio":0.5,
-          "payload_entropy":5.0}, "raise_alert", 1.0),
-        ({**S,"packet_rate":50,"cpu_usage":20,"bandwidth_usage":20,
-          "attack_type":"none"}, "do_nothing", 0.5),
-        ({**S,"packet_rate":80,"cpu_usage":25,"bandwidth_usage":30,
-          "attack_type":"none","connection_count":8,"flow_duration":5.0,
-          "unique_ports":5,"syn_ack_ratio":0.92,
-          "payload_entropy":4.0}, "do_nothing", 0.5),
-        ({**S,"packet_rate":120,"cpu_usage":35,"bandwidth_usage":40,
-          "attack_type":"none","connection_count":15,"flow_duration":8.0,
-          "unique_ports":8,"syn_ack_ratio":0.90,
-          "payload_entropy":4.2}, "do_nothing", 0.5),
-    ]
-    stable = {
-        "packet_rate":50,"cpu_usage":20,"bandwidth_usage":20,
-        "attack_type":"none","connection_count":5,"flow_duration":2.0,
-        "unique_ports":3,"syn_ack_ratio":0.95,"payload_entropy":3.5,
-    }
+    scenarios = _TRAINING_SCENARIOS
+    stable    = _TRAINING_STABLE_STATE
     n = len(scenarios)
     for i in range(rounds):
         state, correct, reward = scenarios[i % n]
@@ -254,8 +328,22 @@ def _silent_pretrain(agents_, rounds=1000):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     import glob
-    if not glob.glob(os.path.join(QTABLE_DIR, "*.pt")):
-        _silent_pretrain(agents, rounds=500)
+    os.makedirs(QTABLE_DIR, exist_ok=True)
+    lock_path = os.path.join(QTABLE_DIR, ".pretrain.lock")
+    try:
+        import fcntl
+        with open(lock_path, "w") as _lock_file:
+            fcntl.flock(_lock_file, fcntl.LOCK_EX)
+            try:
+                if not glob.glob(os.path.join(QTABLE_DIR, "*.pt")):
+                    _silent_pretrain(agents, rounds=500)
+                else:
+                    agents.load_all(QTABLE_DIR)
+            finally:
+                fcntl.flock(_lock_file, fcntl.LOCK_UN)
+    except ImportError:
+        if not glob.glob(os.path.join(QTABLE_DIR, "*.pt")):
+            _silent_pretrain(agents, rounds=500)
     yield
     print("[MACDS] Graceful shutdown — flushing Q-tables...")
     agents.save_all(QTABLE_DIR)
@@ -295,7 +383,8 @@ class AttackLog(BaseModel):
 class FedPayload(BaseModel):
     state_dict_b64: str
 
-_verdicts = []
+from collections import deque
+_verdicts = deque(maxlen=500)
 _vlock = threading.Lock()
 
 @app.get("/health")
@@ -316,122 +405,125 @@ async def receive_log(request: Request, log: AttackLog):
         ts, last_action = _dedup_cache[dedup_key]
         if now - ts < DEDUP_TTL:
             return {"status": "deduplicated", "action_decided": last_action, "confidence": log.confidence}
-    _dedup_cache[dedup_key] = (now, None)
 
-    packets_inspected.inc()
+    _dedup_cache[dedup_key] = (now, "processing")
 
-    current_state = {
-        "packet_rate":      log.packet_rate,
-        "cpu_usage":        log.cpu_usage,
-        "bandwidth_usage":  log.bandwidth_usage,
-        "attack_type":      log.attack_type.lower(),
-        "connection_count": log.connection_count,
-        "flow_duration":    log.flow_duration,
-        "unique_ports":     log.unique_ports,
-        "syn_ack_ratio":    log.syn_ack_ratio,
-        "payload_entropy":  log.payload_entropy,
-    }
-    agent_actions_res = {}
-    
-    if log.attack_type.lower() in ("none", ""):
-        attacked_state = _last_attack_state.get(log.source_ip)
-        if not attacked_state:
-            attacked_state = {
-                "packet_rate": 500, "cpu_usage": 80,
-                "bandwidth_usage": 90, "attack_type": "syn_flood",
-                "connection_count": 500, "flow_duration": 0.1,
-                "unique_ports": 1, "syn_ack_ratio": 0.02,
-                "payload_entropy": 1.0,
-            }
-        
-        final_action = "do_nothing"
-        reward = +1.0
+    try:
+        packets_inspected.inc()
 
-        if log.source_ip in _block_timestamps:
-            elapsed = time.time() - _block_timestamps.pop(log.source_ip)
-            if elapsed < 5.0:
-                final_action = "block_ip"
-                reward = -2.0
-                
-        agents.learn(attacked_state, final_action, reward=reward, next_state=current_state,
-                     attack_type=log.attack_type, confidence=log.confidence)
-        
-        if log.source_ip in _last_attack_state:
-            del _last_attack_state[log.source_ip]
-            
-        push_action(log.source_ip, "unblock_ip")
-        final_action = "unblock_ip"
-    else:
-        _last_attack_state[log.source_ip] = current_state
-        stable_state = {
-            "packet_rate": 50,  "cpu_usage": 20,
-            "bandwidth_usage": 20, "attack_type": "none",
-            "connection_count": 5, "flow_duration": 2.0,
-            "unique_ports": 3,  "syn_ack_ratio": 0.95,
-            "payload_entropy": 3.5,
+        current_state = {
+            "packet_rate":      log.packet_rate,
+            "cpu_usage":        log.cpu_usage,
+            "bandwidth_usage":  log.bandwidth_usage,
+            "attack_type":      log.attack_type.lower(),
+            "connection_count": log.connection_count,
+            "flow_duration":    log.flow_duration,
+            "unique_ports":     log.unique_ports,
+            "syn_ack_ratio":    log.syn_ack_ratio,
+            "payload_entropy":  log.payload_entropy,
         }
+        agent_actions_res = {}
+        
+        if log.attack_type.lower() in ("none", ""):
+            attacked_state = _last_attack_state.get(log.source_ip)
+            skip_learning = attacked_state is None
 
-        agent_actions = agents.act(current_state)
-        agent_actions_res = agent_actions
-        final_action = agents.coordinate(agent_actions, state=current_state)
+            final_action = "do_nothing"
+            reward = +1.0
 
-        original_action = final_action
+            if log.source_ip in _block_timestamps:
+                elapsed = time.time() - _block_timestamps.pop(log.source_ip)
+                if elapsed < 5.0:
+                    final_action = "block_ip"
+                    reward = -2.0
+                    
+            if not skip_learning:
+                with _agents_lock:
+                    agents.learn(attacked_state, final_action, reward=reward,
+                                 next_state=current_state,
+                                 attack_type=log.attack_type, confidence=log.confidence)
 
-        if log.confidence.upper() == "HIGH" and log.attack_type.upper() in BLOCK_ON_SIGHT and original_action == "do_nothing":
-            final_action = "block_ip"
-            agent_overrides.inc()
+            if log.source_ip in _last_attack_state:
+                del _last_attack_state[log.source_ip]
 
-        if final_action == "block_ip":
-            reward = 2.0
-        elif final_action == "raise_alert":
-            reward = 0.5
+            if final_action != "block_ip":
+                push_action(log.source_ip, "unblock_ip")
+                final_action = "unblock_ip"
         else:
-            reward = -2.0
+            _last_attack_state[log.source_ip] = current_state
+            stable_state = {
+                "packet_rate": 50,  "cpu_usage": 20,
+                "bandwidth_usage": 20, "attack_type": "none",
+                "connection_count": 5, "flow_duration": 2.0,
+                "unique_ports": 3,  "syn_ack_ratio": 0.95,
+                "payload_entropy": 3.5,
+            }
 
-        agents.learn(current_state, final_action, reward, next_state=stable_state,
-                     attack_type=log.attack_type, confidence=log.confidence, votes=agent_actions_res)
+            with _agents_lock:
+                agent_actions = agents.act(current_state)
+                agent_actions_res = agent_actions
+                final_action = agents.coordinate(agent_actions, state=current_state)
 
-        if _dynamo_ok:
-            try:
-                table.put_item(Item={
-                    "timestamp": Decimal(str(log.timestamp)),
-                    "attack_type": log.attack_type,
-                    "source_ip": log.source_ip,
-                    "action_decided": final_action,
-                    "packet_rate": str(log.packet_rate),
-                    "confidence": log.confidence,
-                    "detail": log.detail[:500]
-                })
-            except Exception as e:
-                print(f"[DynamoDB ERROR] {e}")
+            original_action = final_action
 
-        if final_action != "do_nothing":
+            if log.confidence.upper() == "HIGH" and log.attack_type.upper() in BLOCK_ON_SIGHT and original_action == "do_nothing":
+                final_action = "block_ip"
+                agent_overrides.inc()
+
             if final_action == "block_ip":
-                _block_timestamps[log.source_ip] = time.time()
-                blocks_total.inc()
-            push_action(log.source_ip, final_action)
+                reward = 2.0
+            elif final_action == "raise_alert":
+                reward = 0.5
+            else:
+                reward = -2.0
 
-    with _vlock:
-        _verdicts.append({
-            "timestamp": log.timestamp,
-            "attack_type": log.attack_type,
-            "source_ip": log.source_ip,
-            "confidence": log.confidence,
-            "detail": log.detail[:200],
-            "action": final_action
-        })
-        if len(_verdicts) > 500:
-            _verdicts.pop(0)
+            with _agents_lock:
+                agents.learn(current_state, final_action, reward, next_state=stable_state,
+                             attack_type=log.attack_type, confidence=log.confidence, votes=agent_actions_res)
 
-    for name, agent in agents.agents.items():
-        agent_epsilon.labels(agent=name).set(agent.epsilon)
+            if _dynamo_ok:
+                try:
+                    table.put_item(Item={
+                        "timestamp": Decimal(str(log.timestamp)),
+                        "attack_type": log.attack_type,
+                        "source_ip": log.source_ip,
+                        "action_decided": final_action,
+                        "packet_rate": str(log.packet_rate),
+                        "confidence": log.confidence,
+                        "detail": log.detail[:500]
+                    })
+                except Exception as e:
+                    print(f"[DynamoDB ERROR] {e}")
 
-    _dedup_cache[dedup_key] = (now, final_action)
+            if final_action != "do_nothing":
+                if final_action == "block_ip":
+                    _block_timestamps[log.source_ip] = time.time()
+                    blocks_total.inc()
+                push_action(log.source_ip, final_action)
 
-    resp = {"status": "success", "action_decided": final_action, "confidence": log.confidence}
-    if agent_actions_res:
-        resp["agents_voted"] = agent_actions_res
-    return resp
+        with _vlock:
+            _verdicts.append({
+                "timestamp": log.timestamp,
+                "attack_type": log.attack_type,
+                "source_ip": log.source_ip,
+                "confidence": log.confidence,
+                "detail": log.detail[:200],
+                "action": final_action,
+            })
+
+        for name, agent in agents.agents.items():
+            agent_epsilon.labels(agent=name).set(agent.epsilon)
+
+        _dedup_cache[dedup_key] = (now, final_action)
+
+        resp = {"status": "success", "action_decided": final_action, "confidence": log.confidence}
+        if agent_actions_res:
+            resp["agents_voted"] = agent_actions_res
+        return resp
+
+    except Exception as e:
+        _dedup_cache.pop(dedup_key, None)
+        raise
 
 @app.get("/api/action")
 async def get_action():
@@ -448,120 +540,28 @@ async def get_verdicts(limit: int = Query(default=50, ge=1, le=500)):
 
 @app.post("/api/train")
 async def train_agents(rounds: int = Query(default=500, ge=1, le=5000)):
-    S = {"connection_count":5,"flow_duration":2.0,
-         "unique_ports":3,"syn_ack_ratio":0.95,"payload_entropy":3.5}
-    scenarios = [
-        ({**S,"packet_rate":3000,"cpu_usage":95,"bandwidth_usage":99,
-          "attack_type":"syn_flood","connection_count":5000,
-          "flow_duration":0.1,"unique_ports":1,"syn_ack_ratio":0.02,
-          "payload_entropy":1.0}, "block_ip", 2.0),
-        ({**S,"packet_rate":2500,"cpu_usage":85,"bandwidth_usage":95,
-          "attack_type":"udp_flood","connection_count":3000,
-          "flow_duration":0.05,"unique_ports":1,"syn_ack_ratio":1.0,
-          "payload_entropy":7.5}, "block_ip", 2.0),
-        ({**S,"packet_rate":2000,"cpu_usage":80,"bandwidth_usage":90,
-          "attack_type":"icmp_flood","connection_count":2000,
-          "flow_duration":0.01,"unique_ports":1,"syn_ack_ratio":1.0,
-          "payload_entropy":0.5}, "block_ip", 2.0),
-        ({**S,"packet_rate":1500,"cpu_usage":75,"bandwidth_usage":85,
-          "attack_type":"http_flood","connection_count":1500,
-          "flow_duration":0.3,"unique_ports":1,"syn_ack_ratio":0.5,
-          "payload_entropy":4.5}, "block_ip", 2.0),
-        ({**S,"packet_rate":200,"cpu_usage":30,"bandwidth_usage":20,
-          "attack_type":"port_scan","connection_count":200,
-          "flow_duration":0.1,"unique_ports":500,"syn_ack_ratio":0.1,
-          "payload_entropy":0.0}, "raise_alert", 1.0),
-        ({**S,"packet_rate":50,"cpu_usage":20,"bandwidth_usage":10,
-          "attack_type":"sql_injection","connection_count":3,
-          "flow_duration":1.5,"unique_ports":1,"syn_ack_ratio":0.99,
-          "payload_entropy":4.2}, "block_ip", 2.0),
-        ({**S,"packet_rate":50,"cpu_usage":20,"bandwidth_usage":10,
-          "attack_type":"xss","connection_count":3,"flow_duration":1.0,
-          "unique_ports":1,"syn_ack_ratio":0.99,
-          "payload_entropy":4.0}, "block_ip", 2.0),
-        ({**S,"packet_rate":50,"cpu_usage":20,"bandwidth_usage":10,
-          "attack_type":"path_traversal","connection_count":2,
-          "flow_duration":0.8,"unique_ports":1,"syn_ack_ratio":0.99,
-          "payload_entropy":3.8}, "block_ip", 2.0),
-        ({**S,"packet_rate":20,"cpu_usage":15,"bandwidth_usage":5,
-          "attack_type":"log4shell","connection_count":1,
-          "flow_duration":0.5,"unique_ports":1,"syn_ack_ratio":0.99,
-          "payload_entropy":5.5}, "block_ip", 2.0),
-        ({**S,"packet_rate":20,"cpu_usage":15,"bandwidth_usage":5,
-          "attack_type":"shellshock","connection_count":1,
-          "flow_duration":0.3,"unique_ports":1,"syn_ack_ratio":0.99,
-          "payload_entropy":4.8}, "block_ip", 2.0),
-        ({**S,"packet_rate":20,"cpu_usage":15,"bandwidth_usage":5,
-          "attack_type":"cmd_injection","connection_count":1,
-          "flow_duration":0.4,"unique_ports":1,"syn_ack_ratio":0.99,
-          "payload_entropy":4.5}, "block_ip", 2.0),
-        ({**S,"packet_rate":30,"cpu_usage":20,"bandwidth_usage":10,
-          "attack_type":"ssrf","connection_count":2,"flow_duration":1.0,
-          "unique_ports":1,"syn_ack_ratio":0.99,
-          "payload_entropy":4.3}, "block_ip", 2.0),
-        ({**S,"packet_rate":500,"cpu_usage":50,"bandwidth_usage":60,
-          "attack_type":"dns_amplification","connection_count":100,
-          "flow_duration":0.05,"unique_ports":1,"syn_ack_ratio":1.0,
-          "payload_entropy":6.0}, "block_ip", 2.0),
-        ({**S,"packet_rate":100,"cpu_usage":20,"bandwidth_usage":15,
-          "attack_type":"dns_dga","connection_count":20,
-          "flow_duration":0.5,"unique_ports":1,"syn_ack_ratio":1.0,
-          "payload_entropy":5.8}, "block_ip", 2.0),
-        ({**S,"packet_rate":50,"cpu_usage":10,"bandwidth_usage":5,
-          "attack_type":"ssh_brute_force","connection_count":30,
-          "flow_duration":0.3,"unique_ports":1,"syn_ack_ratio":0.9,
-          "payload_entropy":3.0}, "block_ip", 2.0),
-        ({**S,"packet_rate":40,"cpu_usage":10,"bandwidth_usage":5,
-          "attack_type":"rdp_brute_force","connection_count":25,
-          "flow_duration":0.4,"unique_ports":1,"syn_ack_ratio":0.9,
-          "payload_entropy":3.2}, "block_ip", 2.0),
-        ({**S,"packet_rate":30,"cpu_usage":10,"bandwidth_usage":5,
-          "attack_type":"ftp_brute_force","connection_count":20,
-          "flow_duration":0.5,"unique_ports":1,"syn_ack_ratio":0.9,
-          "payload_entropy":2.8}, "block_ip", 2.0),
-        ({**S,"packet_rate":200,"cpu_usage":30,"bandwidth_usage":80,
-          "attack_type":"data_exfiltration","connection_count":5,
-          "flow_duration":120.0,"unique_ports":3,"syn_ack_ratio":0.99,
-          "payload_entropy":7.8}, "block_ip", 2.0),
-        ({**S,"packet_rate":100,"cpu_usage":25,"bandwidth_usage":30,
-          "attack_type":"craft_attack","connection_count":50,
-          "flow_duration":0.1,"unique_ports":50,"syn_ack_ratio":0.05,
-          "payload_entropy":0.5}, "block_ip", 2.0),
-        ({**S,"packet_rate":50,"cpu_usage":20,"bandwidth_usage":10,
-          "attack_type":"land_attack","connection_count":1,
-          "flow_duration":0.0,"unique_ports":1,"syn_ack_ratio":0.0,
-          "payload_entropy":0.0}, "block_ip", 2.0),
-        ({**S,"packet_rate":300,"cpu_usage":40,"bandwidth_usage":50,
-          "attack_type":"anomaly","connection_count":50,
-          "flow_duration":5.0,"unique_ports":20,"syn_ack_ratio":0.5,
-          "payload_entropy":5.0}, "raise_alert", 1.0),
-        ({**S,"packet_rate":50,"cpu_usage":20,"bandwidth_usage":20,
-          "attack_type":"none"}, "do_nothing", 0.5),
-        ({**S,"packet_rate":80,"cpu_usage":25,"bandwidth_usage":30,
-          "attack_type":"none","connection_count":8,"flow_duration":5.0,
-          "unique_ports":5,"syn_ack_ratio":0.92,
-          "payload_entropy":4.0}, "do_nothing", 0.5),
-        ({**S,"packet_rate":120,"cpu_usage":35,"bandwidth_usage":40,
-          "attack_type":"none","connection_count":15,"flow_duration":8.0,
-          "unique_ports":8,"syn_ack_ratio":0.90,
-          "payload_entropy":4.2}, "do_nothing", 0.5),
-    ]
-    stable_state = {
-        "packet_rate":50,"cpu_usage":20,"bandwidth_usage":20,
-        "attack_type":"none","connection_count":5,"flow_duration":2.0,
-        "unique_ports":3,"syn_ack_ratio":0.95,"payload_entropy":3.5,
-    }
+    import asyncio
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _train_agents_sync, rounds)
+
+def _train_agents_sync(rounds: int) -> dict:
+    scenarios   = _TRAINING_SCENARIOS
+    stable_state = _TRAINING_STABLE_STATE
     block_count = 0
     scen_ct = len(scenarios)
-    for i in range(rounds):
-        state, correct, reward = scenarios[i % scen_ct]
-        actions = agents.act(state)
-        final = agents.coordinate(actions, state=state)
-        actual_reward = reward if final == correct else -1.0
-        agents.learn(state, final, actual_reward, next_state=stable_state,
-                     attack_type=state["attack_type"])
-        if final == "block_ip":
-            block_count += 1
+    BATCH_SIZE = 50
+    for batch_start in range(0, rounds, BATCH_SIZE):
+        batch_end = min(batch_start + BATCH_SIZE, rounds)
+        with _agents_lock:
+            for i in range(batch_start, batch_end):
+                state, correct, reward = scenarios[i % scen_ct]
+                actions = agents.act(state)
+                final = agents.coordinate(actions, state=state)
+                actual_reward = reward if final == correct else -1.0
+                agents.learn(state, final, actual_reward, next_state=stable_state,
+                             attack_type=state["attack_type"])
+                if final == "block_ip":
+                    block_count += 1
 
     agents.save_all(QTABLE_DIR)
 
@@ -573,7 +573,8 @@ async def train_agents(rounds: int = Query(default=500, ge=1, le=5000)):
     }
 
 @app.post("/api/federate")
-async def post_federate(payload: FedPayload):
+@limiter.limit("10/minute")
+async def post_federate(request: Request, payload: FedPayload):
     return handle_federation(payload.state_dict_b64)
 
 @app.get("/api/status")

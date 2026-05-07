@@ -1,15 +1,15 @@
 {
   "family": "macds-control-plane-task",
   "networkMode": "awsvpc",
-  "executionRoleArn": "arn:aws:iam::904690835691:role/ecsTaskExecutionRole",
-  "taskRoleArn": "arn:aws:iam::904690835691:role/macds-ecs-task-role",
+  "executionRoleArn": "arn:aws:iam::YOUR_AWS_ACCOUNT_ID:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::YOUR_AWS_ACCOUNT_ID:role/macds-ecs-task-role",
   "cpu": "1024",
   "memory": "2048",
   "requiresCompatibilities": ["FARGATE"],
   "containerDefinitions": [
     {
       "name": "macds-control-plane",
-      "image": "904690835691.dkr.ecr.ap-south-1.amazonaws.com/macds-control-plane:latest",
+      "image": "YOUR_AWS_ACCOUNT_ID.dkr.ecr.ap-south-1.amazonaws.com/macds-control-plane:latest",
       "essential": true,
       "portMappings": [
         {
@@ -26,7 +26,7 @@
       "secrets": [
         {
           "name": "MACDS_API_KEY",
-          "valueFrom": "arn:aws:secretsmanager:ap-south-1:904690835691:secret:macds/api-key"
+          "valueFrom": "arn:aws:secretsmanager:ap-south-1:YOUR_AWS_ACCOUNT_ID:secret:macds/api-key"
         }
       ],
       "healthCheck": {

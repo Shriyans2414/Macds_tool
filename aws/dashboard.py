@@ -1,3 +1,4 @@
+from html import escape
 import os
 import requests
 import time
@@ -45,13 +46,16 @@ class Handler(BaseHTTPRequestHandler):
                 actions[ad] += 1
 
         rows = "".join(f'''<tr>
-<td>{i.get("attack_type","")}</td>
-<td>{i.get("source_ip","")}</td>
-<td style="color:{"#f85149" if i.get("action")=="block_ip" else "#d29922" if i.get("action")=="raise_alert" else "#8b949e"}">{i.get("action","")}</td>
-<td>{i.get("packet_rate","")} pps</td>
+<td>{escape(str(i.get("attack_type","")))} </td>
+<td>{escape(str(i.get("source_ip","")))} </td>
+<td style="color:{"#f85149" if i.get("action")=="block_ip" else "#d29922" if i.get("action")=="raise_alert" else "#8b949e"}">{escape(str(i.get("action","")))} </td>
+<td>{escape(str(i.get("packet_rate","")))} pps</td>
 </tr>''' for i in items)
 
-        breakdown = "".join(f'<tr><td>{k}</td><td>{v}</td></tr>' for k,v in counts.items())
+        breakdown = "".join(
+            f'<tr><td>{escape(str(k))}</td><td>{escape(str(v))}</td></tr>'
+            for k, v in counts.items()
+        )
 
         html = f"""<!DOCTYPE html>
 <html>

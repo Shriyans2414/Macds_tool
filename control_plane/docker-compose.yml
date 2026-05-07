@@ -3,12 +3,13 @@ services:
     build: .
     container_name: macds_control_plane
     ports:
-      - "0.0.0.0:8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
       - PYTHONPATH=/app
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
       - AWS_DEFAULT_REGION=ap-south-1
+      - MACDS_API_KEY=${MACDS_API_KEY:?MACDS_API_KEY must be set}
     restart: unless-stopped
     volumes:
       - ./qtables:/app/qtables
