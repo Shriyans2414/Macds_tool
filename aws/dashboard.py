@@ -215,3 +215,27 @@ def render_dashboard():
   </div>
 </body>
 </html>"""
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/health":
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+            return
+        html = render_dashboard().encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(html)))
+        self.end_headers()
+        self.wfile.write(html)
+
+    def log_message(self, *args):
+        pass
+
+if __name__ == "__main__":
+    server = http.server.HTTPServer(("0.0.0.0", DASHBOARD_PORT), Handler)
+    print(f"[*] MACDS Dashboard running at http://0.0.0.0:{DASHBOARD_PORT}")
+    print(f"[*] Control plane: {CONTROL_PLANE_URL}")
+    print(f"[*] DPI log: {DPI_LOG}")
+    server.serve_forever()
