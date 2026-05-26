@@ -33,6 +33,13 @@ except ImportError:
     sys.exit(1)
 
 INTERFACE    = os.environ.get("MACDS_INTERFACE", "eth0")
+
+# IPs to never flag — server's own addresses + trusted infra
+# Set MACDS_WHITELIST as comma-separated IPs in environment
+_WHITELIST_RAW = os.environ.get("MACDS_WHITELIST", "")
+WHITELIST_IPS  = set(
+    ip.strip() for ip in _WHITELIST_RAW.split(",") if ip.strip()
+)
 LOG_DIR      = "logs"
 LOG_FILE     = "logs/dpi_events.csv"
 OFFLINE_MODE = False
@@ -96,7 +103,7 @@ def payload_entropy(data: bytes) -> float:
 _suspicion_scores = defaultdict(lambda: {"score": 0.0, "last_update": 0.0})
 _suspicion_lock   = threading.Lock()
 SUSPICION_DECAY              = 0.95
-SUSPICION_ESCALATE_THRESHOLD = 8.0
+SUSPICION_ESCALATE_THRESHOLD = 15.0
 
 def update_suspicion(ip: str, delta: float) -> float:
     now = time.time()
@@ -517,7 +524,7 @@ def make_verdict(src, pkt, fp, http, dns, payload, behavior,
     if score > 0:
         update_suspicion(src, score)
     cumulative = get_suspicion(src)
-    if score >= 6 or (cumulative >= SUSPICION_ESCALATE_THRESHOLD and score >= 3):
+    if score >= 8 or (cumulative >= SUSPICION_ESCALATE_THRESHOLD and score >= 5):
         verdict, confidence = "ATTACK", "HIGH"
         if cumulative >= SUSPICION_ESCALATE_THRESHOLD:
             reasons.append(f"Cumulative suspicion score={cumulative:.1f}")
@@ -594,6 +601,8 @@ def _handle_verdict(src_ip, verdict_result, pkt):
 def on_packet(pkt):
     src_ip = get_src_ip(pkt)
     if not src_ip: return
+    if src_ip in WHITELIST_IPS:
+        return
     try:
         update_profile(pkt)
         update_flow(pkt)
